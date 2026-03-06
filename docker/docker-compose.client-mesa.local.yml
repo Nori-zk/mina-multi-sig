@@ -1,0 +1,9 @@
+services:
+  client-mesa:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.client
+      args:
+        FEATURES: mesa
+    stdin_open: true
+    tty: true

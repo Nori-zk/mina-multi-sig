@@ -1,0 +1,9 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+      args:
+        FROSTD_COMMITISH: ${FROSTD_COMMITISH}
+    ports:
+      - "2744:2744"

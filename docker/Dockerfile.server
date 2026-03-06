@@ -1,0 +1,41 @@
+# Stage 1: build frostd
+FROM rust:1.92-bookworm AS frostd-builder
+ARG FROSTD_COMMITISH
+RUN cargo install \
+    --git https://github.com/ZcashFoundation/frost-tools.git \
+    --rev ${FROSTD_COMMITISH} \
+    --locked \
+    frostd
+
+# Stage 2: build frost-supervisor (temporary PID 1 workaround — see frost-supervisor/README.md)
+FROM rust:1.92-bookworm AS supervisor-builder
+WORKDIR /build
+COPY docker/frost-supervisor/ .
+RUN cargo build --release
+
+# Stage 3: collect nginx binary and its non-glibc dynamic dependencies.
+# Uses nginx:bookworm (glibc-linked) to match distroless/cc-debian12.
+# patchelf embeds the rpath so the final image can find the bundled libs.
+FROM nginx:bookworm AS nginx-source
+RUN apt-get update && apt-get install -y patchelf && rm -rf /var/lib/apt/lists/*
+RUN set -e; \
+    mkdir -p /nginx-libs; \
+    ldd /usr/sbin/nginx \
+      | awk '/=>/ { print $3 }' \
+      | grep -Ev '(libm\.so|libc\.so|libdl\.so|libpthread\.so|librt\.so|libgcc_s\.so|libresolv\.so|ld-linux)' \
+      | grep -v '^$' \
+      | xargs -I{} cp -n {} /nginx-libs/; \
+    patchelf --set-rpath /usr/local/nginx-libs /usr/sbin/nginx
+
+# Stage 4: minimal distroless runtime
+FROM gcr.io/distroless/cc-debian12
+
+COPY --from=frostd-builder     /usr/local/cargo/bin/frostd                         /usr/local/bin/frostd
+COPY --from=supervisor-builder /build/target/release/frost-supervisor               /usr/local/bin/frost-supervisor
+COPY --from=nginx-source       /usr/sbin/nginx                                      /usr/sbin/nginx
+COPY --from=nginx-source       /nginx-libs/                                         /usr/local/nginx-libs/
+COPY                           docker/nginx.conf                                     /etc/nginx/nginx.conf
+
+EXPOSE 2744
+
+ENTRYPOINT ["/usr/local/bin/frost-supervisor"]

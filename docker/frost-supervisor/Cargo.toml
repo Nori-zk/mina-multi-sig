@@ -1,0 +1,12 @@
+[package]
+name = "frost-supervisor"
+version = "0.1.0"
+edition = "2021"
+
+# Temporary workaround: frostd hardcodes 127.0.0.1 when --no-tls-very-insecure
+# is set, making it unreachable from outside the container. This supervisor runs
+# frostd + nginx in the same process/container until upstream adds --allow-public-no-tls.
+# See: docker/frostd-upstream-issue.md
+
+[dependencies]
+libc = "0.2"

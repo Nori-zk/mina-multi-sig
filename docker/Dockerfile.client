@@ -1,0 +1,13 @@
+FROM rust:1.92-bookworm AS builder
+
+WORKDIR /build
+COPY . .
+
+ARG FEATURES=""
+RUN cargo build --release -p mina-frost-client ${FEATURES:+--features $FEATURES}
+
+FROM gcr.io/distroless/cc-debian12
+
+COPY --from=builder /build/target/release/mina-frost-client /usr/local/bin/mina-frost-client
+
+ENTRYPOINT ["/usr/local/bin/mina-frost-client"]

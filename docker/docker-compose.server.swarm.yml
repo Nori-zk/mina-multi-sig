@@ -1,0 +1,64 @@
+version: "3.9"
+
+services:
+  caddy_server: # Load balancer 
+    image: lucaslorentz/caddy-docker-proxy:ci-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    networks:
+      - caddy_controller
+      - web
+    environment:
+      - CADDY_DOCKER_MODE=server
+      - CADDY_CONTROLLER_NETWORK=10.200.200.0/24
+    volumes:
+      - caddy_server_data:/data # Persisted certificates found in /var/lib/docker/volumes/... etc on loadbalancer
+    deploy:
+      replicas: 3
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        caddy.email: example@email.com
+        caddy.acme_ca: https://acme-v02.api.letsencrypt.org/directory
+        caddy_controlled_server:
+
+  caddy_controller: # Load balancer controller
+    image: lucaslorentz/caddy-docker-proxy:ci-alpine
+    networks:
+      - caddy_controller
+      - web
+    environment:
+      - CADDY_DOCKER_MODE=controller
+      - CADDY_CONTROLLER_NETWORK=10.200.200.0/24
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  frost-server:
+    image: ${REGISTRY:-0x6a6f6e6e79}/frost-server:latest # Pin to a specific version tag in production for predictable deployments
+    networks:
+      - web
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        caddy: frost.example.com
+        caddy.reverse_proxy: "{{upstreams 2744}}"
+
+volumes:
+  caddy_server_data:
+
+networks:
+  web:
+    external: true
+    attachable: true
+  caddy_controller:
+    external: true
+    attachable: true
