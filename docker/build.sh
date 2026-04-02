@@ -109,7 +109,7 @@ trap cleanup EXIT INT TERM
 # --- Setup ---
 
 section "QEMU Setup"
-log "Registering QEMU handlers..."
+log "Registering QEMU handlers (needed for arm64 runtime stages)..."
 docker run --rm --privileged multiarch/qemu-user-static --reset -p yes >/dev/null 2>&1 || true
 success "QEMU ready"
 
