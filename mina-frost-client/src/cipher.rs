@@ -205,9 +205,24 @@ impl Cipher {
         })
     }
 
+    // Max plaintext bytes per Noise frame. The Noise spec caps messages at 65535 bytes.
+    // Noise_K handshake overhead is 48 bytes (32 ephemeral key + 16 AEAD tag).
+    // Transport mode overhead is 16 bytes (AEAD tag only).
+    // We use the smaller limit (handshake) for all chunks to keep things simple.
+    const MAX_CHUNK_PLAINTEXT: usize = api::MAX_MSG_SIZE - 48;
+
     // Encrypts a message for a given recipient. If `recipient` is None, this
     // will encrypt to the single recipient passed to [`Cipher::new()`]; if more
     // than one was passed, it will panic.
+    //
+    // Messages larger than a single Noise frame are split into chunks, each
+    // encrypted as a separate Noise frame. The output is framed as:
+    //   [4 bytes: num_chunks as u32 BE]
+    //   [4 bytes: chunk_0_len as u32 BE][chunk_0_encrypted_bytes]
+    //   [4 bytes: chunk_1_len as u32 BE][chunk_1_encrypted_bytes]
+    //   ...
+    // The first chunk carries the Noise_K handshake; subsequent chunks use
+    // transport mode. The receiver must decrypt chunks in order.
     pub fn encrypt(
         &mut self,
         recipient: Option<&PublicKey>,
@@ -224,13 +239,28 @@ impl Cipher {
             .send_noise_map
             .get_mut(&recipient)
             .ok_or(Error::UnkownRecipient)?;
-        let mut encrypted = vec![0; api::MAX_MSG_SIZE];
-        let len = noise.write_message(&msg, &mut encrypted)?;
-        encrypted.truncate(len);
-        Ok(encrypted)
+
+        let chunks: Vec<&[u8]> = if msg.is_empty() {
+            vec![&[]]
+        } else {
+            msg.chunks(Self::MAX_CHUNK_PLAINTEXT).collect()
+        };
+        let num_chunks = chunks.len() as u32;
+
+        let mut output = Vec::new();
+        output.extend_from_slice(&num_chunks.to_be_bytes());
+
+        let mut encrypted_buf = vec![0u8; api::MAX_MSG_SIZE];
+        for chunk in chunks {
+            let len = noise.write_message(chunk, &mut encrypted_buf)?;
+            output.extend_from_slice(&(len as u32).to_be_bytes());
+            output.extend_from_slice(&encrypted_buf[..len]);
+        }
+
+        Ok(output)
     }
 
-    // Decrypts a message.
+    // Decrypts a message. Handles the chunked framing format produced by encrypt().
     // Note that this authenticates the `sender` in the `Msg` struct; if the
     // sender is tampered with, the message would fail to decrypt.
     pub fn decrypt(&mut self, msg: Msg) -> Result<Msg, Error> {
@@ -238,13 +268,42 @@ impl Cipher {
             .recv_noise_map
             .get_mut(&msg.sender)
             .ok_or(Error::UnkownSender)?;
-        let mut decrypted = vec![0; api::MAX_MSG_SIZE];
-        decrypted.resize(api::MAX_MSG_SIZE, 0);
-        let len = noise.read_message(&msg.msg, &mut decrypted)?;
-        decrypted.truncate(len);
+
+        let data = &msg.msg;
+        if data.len() < 4 {
+            return Err(Error::SnowError(snow::Error::Decrypt));
+        }
+
+        let num_chunks = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let mut cursor = 4;
+        let mut plaintext = Vec::new();
+        let mut decrypted_buf = vec![0u8; api::MAX_MSG_SIZE];
+
+        for _ in 0..num_chunks {
+            if cursor + 4 > data.len() {
+                return Err(Error::SnowError(snow::Error::Decrypt));
+            }
+            let chunk_len = u32::from_be_bytes([
+                data[cursor],
+                data[cursor + 1],
+                data[cursor + 2],
+                data[cursor + 3],
+            ]) as usize;
+            cursor += 4;
+
+            if cursor + chunk_len > data.len() {
+                return Err(Error::SnowError(snow::Error::Decrypt));
+            }
+            let chunk = &data[cursor..cursor + chunk_len];
+            cursor += chunk_len;
+
+            let len = noise.read_message(chunk, &mut decrypted_buf)?;
+            plaintext.extend_from_slice(&decrypted_buf[..len]);
+        }
+
         Ok(Msg {
             sender: msg.sender,
-            msg: decrypted,
+            msg: plaintext,
         })
     }
 }
@@ -254,6 +313,122 @@ mod tests {
     use super::*;
     use mina_tx::{network_id::NetworkIdEnvelope, TransactionEnvelope};
     use mina_signer::NetworkId;
+
+    /// Helper: create a pair of Ciphers that can talk to each other
+    fn make_cipher_pair() -> (Cipher, Cipher, PublicKey, PublicKey) {
+        let (privkey_a, pubkey_a) = Cipher::generate_keypair().unwrap();
+        let (privkey_b, pubkey_b) = Cipher::generate_keypair().unwrap();
+        let cipher_a = Cipher::new(privkey_a, vec![pubkey_b.clone()]).unwrap();
+        let cipher_b = Cipher::new(privkey_b, vec![pubkey_a.clone()]).unwrap();
+        (cipher_a, cipher_b, pubkey_a, pubkey_b)
+    }
+
+    // ---- Baseline: encrypt/decrypt roundtrips that must keep working ----
+
+    #[test]
+    fn test_roundtrip_small_message() {
+        let (mut cipher_a, mut cipher_b, pubkey_a, pubkey_b) = make_cipher_pair();
+        let original = b"hello frost".to_vec();
+
+        let encrypted = cipher_a.encrypt(Some(&pubkey_b), original.clone()).unwrap();
+        assert_ne!(encrypted, original);
+
+        let decrypted = cipher_b
+            .decrypt(Msg { sender: pubkey_a, msg: encrypted })
+            .unwrap();
+        assert_eq!(decrypted.msg, original);
+    }
+
+    #[test]
+    fn test_roundtrip_empty_message() {
+        let (mut cipher_a, mut cipher_b, pubkey_a, pubkey_b) = make_cipher_pair();
+        let original = vec![];
+
+        let encrypted = cipher_a.encrypt(Some(&pubkey_b), original.clone()).unwrap();
+        let decrypted = cipher_b
+            .decrypt(Msg { sender: pubkey_a, msg: encrypted })
+            .unwrap();
+        assert_eq!(decrypted.msg, original);
+    }
+
+    #[test]
+    fn test_roundtrip_small_transaction() {
+        let (mut cipher_a, mut cipher_b, pubkey_a, pubkey_b) = make_cipher_pair();
+
+        let json = include_str!("../../mina-tx/tests/data/payment-zkapp.json");
+        let envelope = TransactionEnvelope::from_str_network(
+            json,
+            NetworkIdEnvelope::from(NetworkId::TESTNET),
+        )
+        .unwrap();
+        let original = envelope.serialize().unwrap();
+        eprintln!("Small tx roundtrip size: {} bytes", original.len());
+
+        let encrypted = cipher_a.encrypt(Some(&pubkey_b), original.clone()).unwrap();
+        let decrypted = cipher_b
+            .decrypt(Msg { sender: pubkey_a, msg: encrypted })
+            .unwrap();
+        assert_eq!(decrypted.msg, original);
+    }
+
+    // ---- Large messages: should pass after chunking is implemented ----
+
+    #[test]
+    fn test_roundtrip_large_deploy_transaction() {
+        let (mut cipher_a, mut cipher_b, pubkey_a, pubkey_b) = make_cipher_pair();
+
+        let json = include_str!("../../mina-tx/tests/data/deploy-v0.0.4-unsigned.json");
+        let envelope = TransactionEnvelope::from_str_network(
+            json,
+            NetworkIdEnvelope::from(NetworkId::TESTNET),
+        )
+        .unwrap();
+        let envelope_bytes = envelope.serialize().unwrap();
+
+        // Simulate the hex encoding frost-core applies to message bytes in SigningPackage
+        let original = hex::encode(&envelope_bytes).into_bytes();
+        eprintln!("Hex-encoded deploy tx size: {} bytes", original.len());
+        assert!(original.len() > api::MAX_MSG_SIZE);
+
+        let encrypted = cipher_a
+            .encrypt(Some(&pubkey_b), original.clone())
+            .expect("large message encryption should succeed with chunking");
+        let decrypted = cipher_b
+            .decrypt(Msg { sender: pubkey_a, msg: encrypted })
+            .expect("large message decryption should succeed with chunking");
+        assert_eq!(decrypted.msg, original);
+    }
+
+    #[test]
+    fn test_roundtrip_exactly_at_noise_limit() {
+        let (mut cipher_a, mut cipher_b, pubkey_a, pubkey_b) = make_cipher_pair();
+        // Just over the max single-frame plaintext to force 2 chunks
+        let original = vec![0xABu8; 65488];
+
+        let encrypted = cipher_a
+            .encrypt(Some(&pubkey_b), original.clone())
+            .expect("boundary message should encrypt");
+        let decrypted = cipher_b
+            .decrypt(Msg { sender: pubkey_a, msg: encrypted })
+            .expect("boundary message should decrypt");
+        assert_eq!(decrypted.msg, original);
+    }
+
+    #[test]
+    fn test_roundtrip_200kb_message() {
+        let (mut cipher_a, mut cipher_b, pubkey_a, pubkey_b) = make_cipher_pair();
+        let original = vec![0x42u8; 200_000];
+
+        let encrypted = cipher_a
+            .encrypt(Some(&pubkey_b), original.clone())
+            .expect("200KB message should encrypt with chunking");
+        let decrypted = cipher_b
+            .decrypt(Msg { sender: pubkey_a, msg: encrypted })
+            .expect("200KB message should decrypt with chunking");
+        assert_eq!(decrypted.msg, original);
+    }
+
+    // ---- Existing diagnostic tests ----
 
     #[test]
     fn test_encrypt_small_transaction_succeeds() {
@@ -333,10 +508,11 @@ mod tests {
             if large_result.is_ok() { "OK" } else { "FAILED" }
         );
 
+        // With chunking, this now succeeds — previously it hit the Noise 65535-byte limit
         assert!(
-            large_result.is_err(),
+            large_result.is_ok(),
             "Encrypting a payload the size of the hex-encoded deploy tx ({} bytes) should \
-             fail with SnowError because it exceeds the Noise 65535-byte message limit",
+             succeed with chunking",
             hex_encoded_size
         );
     }
