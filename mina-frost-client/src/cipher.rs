@@ -248,3 +248,96 @@ impl Cipher {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mina_tx::{network_id::NetworkIdEnvelope, TransactionEnvelope};
+    use mina_signer::NetworkId;
+
+    #[test]
+    fn test_encrypt_small_transaction_succeeds() {
+        // A small payment-style zkapp transaction — should fit within Noise limits
+        let json = include_str!("../../mina-tx/tests/data/payment-zkapp.json");
+        let envelope = TransactionEnvelope::from_str_network(
+            json,
+            NetworkIdEnvelope::from(NetworkId::TESTNET),
+        )
+        .unwrap();
+        let message_bytes = envelope.serialize().unwrap();
+
+        let msg_size = message_bytes.len();
+        eprintln!("Small tx serialized size: {} bytes", msg_size);
+        assert!(msg_size < 65535, "small tx should be under Noise limit");
+
+        // Verify encryption works
+        let (privkey_a, pubkey_a) = Cipher::generate_keypair().unwrap();
+        let (privkey_b, pubkey_b) = Cipher::generate_keypair().unwrap();
+
+        let mut cipher_a = Cipher::new(privkey_a, vec![pubkey_b.clone()]).unwrap();
+        let encrypted = cipher_a.encrypt(Some(&pubkey_b), message_bytes.clone());
+        assert!(encrypted.is_ok(), "small tx encryption should succeed");
+    }
+
+    #[test]
+    fn test_encrypt_deploy_v004_transaction_fails_noise_limit() {
+        // The deploy-v0.0.4 transaction with verification keys is large.
+        // After being wrapped in a TransactionEnvelope, serialized, then put into a
+        // SigningPackage and serialized AGAIN (with hex encoding of the message bytes),
+        // the payload exceeds the Noise protocol's 65535-byte message limit.
+        let json = include_str!("../../mina-tx/tests/data/deploy-v0.0.4-unsigned.json");
+        let envelope = TransactionEnvelope::from_str_network(
+            json,
+            NetworkIdEnvelope::from(NetworkId::TESTNET),
+        )
+        .unwrap();
+        let message_bytes = envelope.serialize().unwrap();
+
+        let msg_size = message_bytes.len();
+        eprintln!("Deploy tx serialized envelope size: {} bytes", msg_size);
+
+        // Simulate what the coordinator does: wrap in SendSigningPackageArgs and serialize.
+        // The SigningPackage contains commitments + message, then gets serde_json serialized.
+        // frost-core hex-encodes the message bytes, roughly doubling the size.
+        // We can't easily construct a real SigningPackage here without commitments,
+        // but we can check the raw envelope size and the hex-encoded size.
+        let hex_encoded_size = msg_size * 2; // serdect hex encoding
+        eprintln!("Estimated hex-encoded message size: {} bytes", hex_encoded_size);
+        eprintln!("Noise limit: {} bytes", api::MAX_MSG_SIZE);
+
+        // Directly test: can we encrypt a payload this size?
+        let (privkey_a, _pubkey_a) = Cipher::generate_keypair().unwrap();
+        let (_privkey_b, pubkey_b) = Cipher::generate_keypair().unwrap();
+
+        let mut cipher = Cipher::new(privkey_a, vec![pubkey_b.clone()]).unwrap();
+
+        // Try encrypting the raw envelope bytes (46KB) — this might work on its own
+        let raw_result = cipher.encrypt(Some(&pubkey_b), message_bytes.clone());
+        eprintln!(
+            "Raw envelope encrypt ({}B): {}",
+            msg_size,
+            if raw_result.is_ok() { "OK" } else { "FAILED" }
+        );
+
+        // Now try a payload at the size it would be after serde_json serialization
+        // of SendSigningPackageArgs (hex-encoded message + commitments + JSON overhead)
+        let large_payload = vec![0u8; hex_encoded_size];
+        // Need a fresh cipher since Noise_K state is consumed after first write
+        let (privkey_c, _pubkey_c) = Cipher::generate_keypair().unwrap();
+        let (_privkey_d, pubkey_d) = Cipher::generate_keypair().unwrap();
+        let mut cipher2 = Cipher::new(privkey_c, vec![pubkey_d.clone()]).unwrap();
+        let large_result = cipher2.encrypt(Some(&pubkey_d), large_payload);
+        eprintln!(
+            "Hex-sized payload encrypt ({}B): {}",
+            hex_encoded_size,
+            if large_result.is_ok() { "OK" } else { "FAILED" }
+        );
+
+        assert!(
+            large_result.is_err(),
+            "Encrypting a payload the size of the hex-encoded deploy tx ({} bytes) should \
+             fail with SnowError because it exceeds the Noise 65535-byte message limit",
+            hex_encoded_size
+        );
+    }
+}
