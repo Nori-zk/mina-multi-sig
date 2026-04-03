@@ -88,19 +88,26 @@ impl TransactionEnvelope {
     pub fn from_str_network(s: &str, network_id: NetworkIdEnvelope) -> Result<Self, MinaTxError> {
         let s = s.trim();
 
-        // Try parsing as ZkApp transaction first
-        if let Ok(zkapp) = serde_json::from_str::<ZKAppCommand>(s) {
-            return Ok(Self::new_zkapp(network_id.0, zkapp));
-        }
+        // Try parsing as ZkApp transaction first, then Legacy.
+        // IMPORTANT: Do NOT silently swallow parse errors here. If both fail, the caller
+        // needs to see the actual serde errors to diagnose the problem — not a generic
+        // "unknown transaction type" message that tells them nothing.
+        let zkapp_err = match serde_json::from_str::<ZKAppCommand>(s) {
+            Ok(zkapp) => return Ok(Self::new_zkapp(network_id.0, zkapp)),
+            Err(e) => e,
+        };
 
-        // Try parsing as Legacy transaction
-        if let Ok(legacy) = serde_json::from_str::<LegacyTransaction>(s) {
-            return Ok(Self::new_legacy(network_id.0, legacy));
-        }
+        let legacy_err = match serde_json::from_str::<LegacyTransaction>(s) {
+            Ok(legacy) => return Ok(Self::new_legacy(network_id.0, legacy)),
+            Err(e) => e,
+        };
 
-        // Neither worked, return an error
         Err(MinaTxError::UnknownTransactionType(
-            "Unable to parse transaction. Expected a valid legacy transaction or ZkApp transaction JSON.".to_string()
+            alloc::format!(
+                "Unable to parse transaction as ZkApp or Legacy.\n  ZkApp parse error: {}\n  Legacy parse error: {}",
+                zkapp_err,
+                legacy_err
+            )
         ))
     }
 
@@ -266,6 +273,85 @@ mod tests {
         let envelope = result.unwrap();
         assert!(!envelope.is_legacy());
         assert_eq!(envelope.network_id() as u8, 1);
+    }
+
+    /// Regression test: deploy-v0.0.4-unsigned.json fails to parse because ZkappUri and
+    /// TokenSymbol use derive(Serialize, Deserialize) on Vec<u8>, which expects a JSON
+    /// array of integers. But o1js serializes these as plain strings.
+    /// e.g. "zkappUri": "https://..." and "tokenSymbol": "MOCKnE"
+    #[test]
+    fn test_parse_deploy_v004_zkapp_uri_as_string() {
+        let json = include_str!("../tests/data/deploy-v0.0.4-unsigned.json");
+        let result = TransactionEnvelope::from_str_network(
+            json,
+            NetworkIdEnvelope::from(NetworkId::TESTNET),
+        );
+        assert!(
+            result.is_ok(),
+            "Failed to parse deploy-v0.0.4-unsigned.json: {:?}",
+            result.unwrap_err()
+        );
+        let envelope = result.unwrap();
+        assert!(!envelope.is_legacy());
+    }
+
+    /// Minimal reproduction: zkappUri as a string should parse, not require a byte array
+    #[test]
+    fn test_zkapp_uri_string_field() {
+        let json = include_str!("../tests/data/deploy-contract.json");
+        // First ensure the base parses fine (zkappUri: null)
+        let base_result = serde_json::from_str::<ZKAppCommand>(json);
+        assert!(base_result.is_ok(), "Base deploy-contract.json should parse");
+
+        // Now inject a string zkappUri value like o1js produces
+        let modified = json.replace(
+            "\"zkappUri\": null",
+            "\"zkappUri\": \"https://example.com\"",
+        );
+        let result = serde_json::from_str::<ZKAppCommand>(&modified);
+        assert!(
+            result.is_ok(),
+            "ZkApp with string zkappUri should parse but got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    /// ZkappUri with more than 32 characters should parse — the 32-char limit is wrong,
+    /// o1js and the Mina protocol don't enforce it.
+    #[test]
+    fn test_zkapp_uri_longer_than_32_chars() {
+        let json = include_str!("../tests/data/deploy-contract.json");
+        let long_uri = "https://github.com/nori-zk/mock-nori-bridge"; // 45 chars
+        assert!(long_uri.len() > 32);
+
+        let modified = json.replace(
+            "\"zkappUri\": null",
+            &alloc::format!("\"zkappUri\": \"{}\"", long_uri),
+        );
+        let result = serde_json::from_str::<ZKAppCommand>(&modified);
+        assert!(
+            result.is_ok(),
+            "ZkApp with >32 char zkappUri should parse but got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    /// Minimal reproduction: tokenSymbol as a string should parse, not require a byte array
+    #[test]
+    fn test_token_symbol_string_field() {
+        let json = include_str!("../tests/data/deploy-contract.json");
+
+        // Inject a string tokenSymbol value like o1js produces
+        let modified = json.replace(
+            "\"tokenSymbol\": null",
+            "\"tokenSymbol\": \"MOCK\"",
+        );
+        let result = serde_json::from_str::<ZKAppCommand>(&modified);
+        assert!(
+            result.is_ok(),
+            "ZkApp with string tokenSymbol should parse but got: {}",
+            result.unwrap_err()
+        );
     }
 
     #[test]

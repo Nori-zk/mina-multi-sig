@@ -464,8 +464,31 @@ impl AuthRequired {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+// NOTE: TokenSymbol is serialized by o1js as a JSON string (e.g. "MOCK"), NOT as a byte array.
+// derive(Serialize, Deserialize) on Vec<u8> expects a JSON array like [77,79,67,75] which
+// doesn't match what o1js produces. Custom serde handles the string <-> bytes conversion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TokenSymbol(pub Vec<u8>);
+
+impl Serialize for TokenSymbol {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = core::str::from_utf8(&self.0).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for TokenSymbol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 impl TokenSymbol {
     pub fn to_bytes(&self, bytes: &mut [u8]) {
@@ -491,17 +514,38 @@ impl core::str::FromStr for TokenSymbol {
 
 // Default is derived for TokenSymbol
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+// NOTE: Same issue as TokenSymbol — o1js serializes zkappUri as a plain JSON string
+// (e.g. "https://github.com/..."), not a byte array. Custom serde required.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ZkappUri(pub Vec<u8>);
+
+impl Serialize for ZkappUri {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = core::str::from_utf8(&self.0).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ZkappUri {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 impl core::str::FromStr for ZkappUri {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() <= 32 {
-            Ok(Self(s.as_bytes().to_vec()))
-        } else {
-            Err("Zkapp URI must be at most 32 characters".to_string())
-        }
+        // The previous 32-char limit was wrong — o1js doesn't enforce it and real deploy
+        // transactions routinely have longer URIs (e.g. GitHub URLs). The packing/hashing
+        // logic handles arbitrary-length URIs fine.
+        Ok(Self(s.as_bytes().to_vec()))
     }
 }
 
