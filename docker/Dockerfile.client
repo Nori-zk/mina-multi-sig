@@ -30,7 +30,9 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
       cargo build --release -p mina-frost-client ${FEATURES:+--features $FEATURES}; \
     fi
 
-FROM gcr.io/distroless/cc-debian12
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/mina-frost-client /usr/local/bin/mina-frost-client
 
