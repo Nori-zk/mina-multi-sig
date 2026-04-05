@@ -2,7 +2,7 @@
 
 use crate::{
     errors::MinaTxError,
-    signatures::Sig,
+    signatures::{Sig, TransactionSignature},
     transactions::{
         legacy_tx::LegacyTransaction,
         network_id::NetworkIdEnvelope,
@@ -87,6 +87,13 @@ impl TransactionEnvelope {
     /// Returns an error if parsing fails for both types.
     pub fn from_str_network(s: &str, network_id: NetworkIdEnvelope) -> Result<Self, MinaTxError> {
         let s = s.trim();
+
+        // Try parsing as a TransactionSignature first (output from a previous signing session).
+        // This enables chained multi-group signing where the output of one session is fed as
+        // input to the next. The inner payload already has the previous signature injected.
+        if let Ok(signed) = serde_json::from_str::<TransactionSignature>(s) {
+            return Ok(signed.payload);
+        }
 
         // Try parsing as ZkApp transaction first, then Legacy.
         // IMPORTANT: Do NOT silently swallow parse errors here. If both fail, the caller
@@ -354,20 +361,23 @@ mod tests {
         );
     }
 
-    /// An already-signed transaction (TransactionSignature output from a previous signing
-    /// session) cannot currently be parsed as input for a second signing session.
-    /// This blocks chained signing ceremonies where multiple groups sign the same transaction.
+    /// A TransactionSignature (output from a previous FROST signing session) should be
+    /// parseable as input for a subsequent signing session, enabling chained multi-group
+    /// signing of the same transaction.
     #[test]
-    fn test_parse_signed_transaction_fails() {
+    fn test_parse_signed_transaction_as_input() {
         let json = include_str!("../tests/data/deploy-v0.0.6-admin-signed.json");
         let result = TransactionEnvelope::from_str_network(
             json,
             NetworkIdEnvelope::from(NetworkId::TESTNET),
         );
         assert!(
-            result.is_err(),
-            "Signed transaction should not parse as a raw TransactionEnvelope (yet)"
+            result.is_ok(),
+            "Signed transaction should be parseable as input: {:?}",
+            result.unwrap_err()
         );
+        let envelope = result.unwrap();
+        assert!(!envelope.is_legacy());
     }
 
     #[test]
