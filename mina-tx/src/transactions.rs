@@ -354,6 +354,22 @@ mod tests {
         );
     }
 
+    /// An already-signed transaction (TransactionSignature output from a previous signing
+    /// session) cannot currently be parsed as input for a second signing session.
+    /// This blocks chained signing ceremonies where multiple groups sign the same transaction.
+    #[test]
+    fn test_parse_signed_transaction_fails() {
+        let json = include_str!("../tests/data/deploy-v0.0.6-admin-signed.json");
+        let result = TransactionEnvelope::from_str_network(
+            json,
+            NetworkIdEnvelope::from(NetworkId::TESTNET),
+        );
+        assert!(
+            result.is_err(),
+            "Signed transaction should not parse as a raw TransactionEnvelope (yet)"
+        );
+    }
+
     #[test]
     fn test_from_str_network_invalid_json() {
         let result = TransactionEnvelope::from_str_network(
